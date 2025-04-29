@@ -27,8 +27,9 @@ CACHE_TTL_SECONDS = 3600 # 1 hour
 # --- Font Handling for PDF ---
 FONT_PATH = None
 potential_paths = [
-    "DejaVuSans.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "DejaVuSans.ttf", # Check current directory first
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", # Common Linux path
+    # Add other potential paths for different OS if needed
 ]
 for path in potential_paths:
     if os.path.exists(path):
@@ -37,33 +38,47 @@ for path in potential_paths:
 
 # --- API Key and Client Setup ---
 try:
-    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    # Ensure secrets are loaded correctly for Streamlit deployment/local
+    if 'GEMINI_API_KEY' in st.secrets:
+        GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+    else:
+        # Fallback for local development if secrets file isn't used/found
+        # You might need to set this environment variable locally
+        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+        if not GEMINI_API_KEY:
+            st.error("🚨 Gemini API Key not found! Set it in Streamlit secrets or as an environment variable.")
+            st.stop()
+
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-except KeyError:
-    st.error("🚨 Gemini API Key not found! Add it to `.streamlit/secrets.toml`.")
+except KeyError: # Catch specific KeyError if st.secrets exists but key doesn't
+    st.error("🚨 Gemini API Key not found in Streamlit secrets (`.streamlit/secrets.toml`).")
     st.stop()
 except Exception as e:
     st.error(f"🚨 Error configuring Gemini: {e}")
     st.stop()
 
 # Pytrends setup (using India settings)
-pytrends = TrendReq(hl='en-IN', tz=-330) # India settings
+# Consider adding error handling around TrendReq initialization if needed
+try:
+    pytrends = TrendReq(hl='en-IN', tz=-330) # India settings, IST timezone offset
+except Exception as e:
+    st.error(f"🚨 Failed to initialize Google Trends connection: {e}")
+    st.stop()
+
 
 # --- Helper Functions ---
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_google_trends(keyword):
-    # --- Keep the FULL get_google_trends function ---
     """Fetches Google Trends data: interest over time and related queries."""
     if not keyword:
         return None, None
     try:
         # Build payload for interest over time
-        pytrends.build_payload([keyword], cat=0, timeframe='today 3-m', geo='', gprop='') # Last 3 months
+        pytrends.build_payload([keyword], cat=0, timeframe='today 3-m', geo='', gprop='')
         interest_over_time_df = pytrends.interest_over_time()
 
-        # Check if the keyword column exists and the DataFrame is not empty
         if interest_over_time_df.empty or keyword not in interest_over_time_df.columns:
              interest_over_time_df = None
         elif keyword in interest_over_time_df.columns:
@@ -77,6 +92,7 @@ def get_google_trends(keyword):
         if keyword in related_queries_dict:
             top_queries = related_queries_dict[keyword].get('top')
             rising_queries = related_queries_dict[keyword].get('rising')
+            # Prefer 'top' queries, fall back to 'rising'
             if top_queries is not None and not top_queries.empty:
                 related_queries_df = top_queries
             elif rising_queries is not None and not rising_queries.empty:
@@ -88,63 +104,97 @@ def get_google_trends(keyword):
         st.warning("⏳ Google Trends request timed out. Please try again later.")
         return None, None
     except Exception as e:
-        if '429' in str(e):
+        # Handle specific pytrends/requests errors if possible, e.g., 429
+        error_str = str(e).lower()
+        if '429' in error_str or 'too many requests' in error_str:
             st.error("🚦 Google Trends Rate Limit Hit (Error 429).")
             st.warning("Too many requests sent to Google Trends. Please WAIT several hours before trying again. Using cache if available.")
             st.session_state.last_error = '429'
+        # Handle cases where Trends returns no data (might raise ResponseError)
+        elif 'response error' in error_str or 'code 500' in error_str:
+             st.warning(f"Google Trends returned an error or no data for '{keyword}'. It might be too specific or have low volume.")
+             st.session_state.last_error = 'Trends Error'
         else:
-            st.error(f"An error occurred fetching Google Trends data: {e}")
+            st.error(f"An unexpected error occurred fetching Google Trends data: {e}")
             st.session_state.last_error = str(e)
         return None, None
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_news_articles(keyword, num_articles=DEFAULT_NUM_ARTICLES):
-    # --- Keep the get_news_articles function ---
     """Fetches news articles related to the keyword using Google News RSS (India)."""
     if not keyword:
         return []
+    articles = [] # Initialize articles list outside try block
     try:
-        query = keyword.replace(' ', '+')
+        # URL encoding the keyword for safety
+        query = requests.utils.quote(keyword)
+        # Using Google News RSS feed URL for India (English)
         news_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
-        feed = feedparser.parse(news_url)
-        articles = []
+
+        # Using requests with a timeout and headers to mimic a browser slightly
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(news_url, timeout=10, headers=headers)
+        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+
+        # Parse the feed content
+        feed = feedparser.parse(response.content)
+
+        if feed.bozo: # Check if feedparser encountered issues parsing
+             st.warning(f"Warning: RSS feed for '{keyword}' might be malformed. Results may be incomplete. (Bozo bit set by feedparser)")
+
         for entry in feed.entries[:num_articles]:
+            # Ensure basic fields exist, default to 'N/A' or None if not critical
             articles.append({
-                "title": entry.title,
-                "link": entry.link,
-                "published": entry.get("published", "N/A"),
-                "summary": entry.get("summary", "N/A") # Value might be None or non-string
+                "title": getattr(entry, 'title', 'N/A'),
+                "link": getattr(entry, 'link', '#'),
+                "published": entry.get("published", "N/A"), # .get is safer for dict keys
+                "summary": getattr(entry, 'summary', None) # Get raw summary, could be None
             })
         return articles
+    except requests.exceptions.RequestException as req_e:
+         st.error(f"Network error fetching news for '{keyword}': {req_e}")
+         return [] # Return empty list on network error
     except Exception as e:
-        st.error(f"Error fetching news articles: {e}")
-        return []
+        st.error(f"Error processing news feed for '{keyword}': {e}")
+        return [] # Return empty list on other parsing errors
+
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def analyze_with_gemini(text_to_analyze, prompt_instruction):
-    # --- Keep the analyze_with_gemini function ---
-    """Uses Gemini API for analysis."""
+    """Uses Gemini API for analysis, with improved error handling."""
     if not text_to_analyze or not GEMINI_API_KEY:
-        return None
+        # Return None or a specific message if no input
+        return "Input text missing for analysis."
     try:
         full_prompt = f"{prompt_instruction}\n\nInput Text/Context:\n---\n{text_to_analyze}\n---"
-        response = gemini_model.generate_content(full_prompt)
+        # Optional: Add safety settings if needed
+        # safety_settings = {...}
+        response = gemini_model.generate_content(
+            full_prompt,
+            # safety_settings=safety_settings
+        )
 
+        # More robust check for content vs. blocked response
         if response.parts:
              text_response = response.text.replace('```markdown', '').replace('```', '').strip()
              return text_response
         elif response.prompt_feedback.block_reason:
-             st.warning(f"Gemini content blocked. Reason: {response.prompt_feedback.block_reason}")
-             return f"Content blocked by safety filter ({response.prompt_feedback.block_reason})."
+             block_reason = response.prompt_feedback.block_reason
+             st.warning(f"Gemini content generation blocked. Reason: {block_reason}")
+             return f"Analysis blocked by safety filter (Reason: {block_reason}). Please modify input or prompt."
         else:
-             return "Gemini returned an empty response."
+             # Handle cases where the response might be valid but empty (no .parts, no block reason)
+             return "Gemini returned an empty response. The input might have been insufficient or the prompt needs adjustment."
 
     except Exception as e:
-        st.error(f"Error calling Gemini API: {e}")
+        # Log the error for debugging if possible (e.g., to Streamlit logs)
+        print(f"Error calling Gemini API: {e}") # Basic print for local debugging
+        st.error(f"An error occurred during AI analysis. Please check logs or try again. Error: {e}")
+        # Try to get more specific feedback if available in the exception
         feedback = getattr(getattr(e, 'response', None), 'prompt_feedback', None)
         if feedback:
-             st.warning(f"Gemini API Feedback: {feedback}")
-        return f"Error during analysis: {e}"
+             st.warning(f"Gemini API Feedback on Error: {feedback}")
+        return f"Error during AI analysis: {e}"
 
 
 # --- PDF Generation Function ---
@@ -161,26 +211,24 @@ class PDF(FPDF):
 
     def footer(self):
         self.set_y(-15)
-        if FONT_PATH:
-            self.set_font('DejaVu', '', 8)
-        else:
-             self.set_font('Arial', 'I', 8)
+        if FONT_PATH: self.set_font('DejaVu', '', 8)
+        else: self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Page {self.page_no()}', 0, 0, 'C')
 
     def chapter_title(self, title):
-        if FONT_PATH:
-            self.set_font('DejaVu', '', 14)
-        else:
-             self.set_font('Arial', 'B', 14)
+        if FONT_PATH: self.set_font('DejaVu', '', 14)
+        else: self.set_font('Arial', 'B', 14)
         self.cell(0, 10, title, 0, 1, 'L')
         self.ln(4)
 
     def chapter_body(self, body):
         if not body: body = "N/A"
+        # Ensure body is string before encoding attempt
+        body_str = str(body)
         if FONT_PATH: self.set_font('DejaVu', '', 10)
         else: self.set_font('Arial', '', 10)
-        try: safe_body = body.encode('latin-1', 'replace').decode('latin-1')
-        except Exception: safe_body = str(body)
+        try: safe_body = body_str.encode('latin-1', 'replace').decode('latin-1')
+        except Exception: safe_body = body_str # Use original string if encoding fails
         self.multi_cell(0, 5, safe_body)
         self.ln()
 
@@ -189,13 +237,14 @@ class PDF(FPDF):
         else: self.set_font('Arial', '', 10)
         self.set_text_color(0, 0, 255)
         safe_text = str(text) if text else "Link"
-        self.cell(0, 5, safe_text, 0, 1, link=link)
+        # FPDF link handling might have issues with very long URLs, keep it concise
+        self.cell(0, 5, safe_text, 0, 1, link=str(link) if link else '#') # Ensure link is string
         self.set_text_color(0, 0, 0)
         self.ln(2)
 
 
 def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles, gemini_results):
-    # --- Keep the generate_pdf_report function ---
+    # --- Keep the generate_pdf_report function structure ---
     pdf = PDF()
     pdf.add_page()
     pdf.chapter_title(f"Research Report for: \"{keyword}\"")
@@ -212,7 +261,7 @@ def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles,
          if FONT_PATH: pdf.set_font('DejaVu', '', 12)
          else: pdf.set_font('Arial', 'B', 12)
          pdf.cell(0, 8, title, 0, 1, 'L')
-         pdf.chapter_body(content)
+         pdf.chapter_body(content) # chapter_body handles None/str conversion
          pdf.ln(5)
 
     pdf.chapter_title("📊 Google Trends Summary")
@@ -226,8 +275,11 @@ def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles,
          pdf.cell(0, 8, "Related Queries (Top/Rising):", 0, 1, 'L')
          if FONT_PATH: pdf.set_font('DejaVu', '', 10)
          else: pdf.set_font('Arial', '', 10)
+         # Handle potential non-string queries safely
          for index, row in related_queries_df.head(10).iterrows():
-              pdf.cell(0, 5, f"- {row['query']} (Value: {row['value']})", 0, 1)
+              query_str = str(row.get('query', 'N/A'))
+              value_str = str(row.get('value', 'N/A'))
+              pdf.cell(0, 5, f"- {query_str} (Value: {value_str})", 0, 1)
          pdf.ln(5)
     else:
          pdf.chapter_body("No related queries data found or retrieved.")
@@ -241,7 +293,7 @@ def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles,
               try: encoded_title = safe_title.encode('latin-1', 'replace').decode('latin-1')
               except Exception: encoded_title = safe_title
               pdf.cell(0, 5, f"{i+1}. {encoded_title}", 0, 1)
-              pdf.add_link(f"   Read Full Article: {article.get('link', '#')}", article.get('link', '#'))
+              pdf.add_link(f"   Read Full Article", article.get('link', '#')) # Simplified link text
               pdf.ln(3)
     else:
          pdf.chapter_body("No news articles were found or retrieved.")
@@ -257,28 +309,32 @@ def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles,
 st.title("📈 Trend Hunter: Research Assistant")
 st.markdown(f"""
 Enter a keyword to research its potential based on recent trends and news.
-This tool gathers data from Google Trends, Google News (India, {DEFAULT_NUM_ARTICLES} articles), and uses Google Gemini AI for analysis and synthesis.
+Gathers data from Google Trends, Google News (India, {DEFAULT_NUM_ARTICLES} articles), uses Google Gemini AI for analysis.
 **Note on Google Trends Error 429:** This means you've hit Google's request limit. Please **WAIT several hours** before trying again.
 """)
-current_time_str = datetime.now().strftime('%A, %B %d, %Y at %I:%M:%S %Z')
-st.caption(f"Current Time (IST): {current_time_str}")
+# Display current time and info about font for PDF
+current_time_str = datetime.now().strftime('%A, %B %d, %Y at %I:%M:%S %p %Z') # Use local time formatting
+st.caption(f"Current Time: {current_time_str}")
 if not FONT_PATH:
     st.caption("⚠️ Warning: DejaVuSans.ttf font not found. PDF export might have issues with special characters.")
 
 # --- Input Section ---
-keyword = st.text_input("Enter Keyword to Research:", placeholder="e.g., electric vehicle charging infrastructure india")
+keyword = st.text_input("Enter Keyword to Research:", placeholder="e.g., solar panel subsidies india", key="keyword_input") # Added key for potential state management later
 search_button = st.button("🔬 Start Research")
 
 # --- Initialize Session State ---
+# Use session state more consistently for holding results and errors
 if 'results_data' not in st.session_state:
     st.session_state.results_data = None
 if 'last_error' not in st.session_state:
      st.session_state.last_error = ''
 
+
 # --- Processing Logic ---
 if search_button and keyword:
     st.markdown("---")
     st.subheader(f"Research Analysis for: \"{keyword}\"")
+    # Reset state before new search
     st.session_state.results_data = None
     st.session_state.last_error = ''
 
@@ -291,24 +347,25 @@ if search_button and keyword:
 
         # 3. Prepare text for Gemini
         news_context_for_analysis = "No relevant news articles found recently for detailed analysis."
-        news_snippets = []
+        num_news = len(news_articles) if news_articles else 0
         if news_articles:
-            st.info(f"📰 Found {len(news_articles)} news articles. Preparing context for AI analysis...")
+            st.info(f"📰 Found {num_news} news articles. Preparing context for AI analysis...")
             news_context_list = []
             for i, article in enumerate(news_articles):
-                 raw_summary = article.get('summary') # Get raw summary
-                 summary_text = str(raw_summary) if raw_summary is not None else "No summary available." # Ensure string
-                 # Basic HTML tag removal
+                 # Ensure summary is string and cleaned before adding to context
+                 raw_summary = article.get('summary')
+                 summary_text = str(raw_summary) if raw_summary is not None else "No summary available."
                  cleaned_summary = summary_text.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '&nbsp;', ' ')
+                 # Construct snippet for AI context
                  snippet = f"Article {i+1} (Title: {article.get('title', 'N/A')} | Published: {article.get('published', 'N/A')}):\nSummary: {cleaned_summary}\nLink: {article.get('link', '#')}\n"
                  news_context_list.append(snippet)
-                 news_snippets.append(snippet)
 
             news_context_for_analysis = "\n---\n".join(news_context_list)
         else:
              st.warning("📰 No news articles found. AI analysis will be based on trends data only (if available).")
 
-        # 4. Gemini Analysis (Revised Prompts)
+
+        # 4. Gemini Analysis (Revised Prompts - Emphasizing Grounding)
         gemini_prompts = {
              "summary": f"You are a factual research assistant. Based *strictly* on the provided news article summaries about '{keyword}', summarize the key factual themes, topics, events, and mentioned entities. Avoid interpretation or adding external information. Focus on accurately reflecting the content of the provided summaries.",
              "sentiment": f"You are an objective sentiment analyst reviewing news about '{keyword}'. Analyze the overall sentiment (Positive, Negative, Neutral) expressed *only within the provided news summaries*. State the dominant sentiment and **justify your conclusion by quoting one or two specific phrases or sentences from the provided text** that strongly support this sentiment rating.",
@@ -319,34 +376,42 @@ if search_button and keyword:
         gemini_results = {}
         analysis_skipped_message = "Analysis skipped as no news articles were found."
 
-        if news_articles:
-            gemini_results["summary"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["summary"])
-            gemini_results["sentiment"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["sentiment"])
-            gemini_results["insights"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["insights"])
-        else:
-            gemini_results["summary"] = analysis_skipped_message
-            gemini_results["sentiment"] = analysis_skipped_message
-            gemini_results["insights"] = analysis_skipped_message
+        # Initialize results with default messages
+        gemini_results["summary"] = analysis_skipped_message
+        gemini_results["sentiment"] = analysis_skipped_message
+        gemini_results["insights"] = analysis_skipped_message
+        gemini_results["research_synthesis"] = "Synthesis skipped or incomplete due to missing news data."
 
+        # Run analysis that depends on news context *only if* news was found
+        if news_articles:
+            gemini_results["summary"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["summary"]) or "AI analysis failed or returned empty for Summary."
+            gemini_results["sentiment"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["sentiment"]) or "AI analysis failed or returned empty for Sentiment."
+            gemini_results["insights"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["insights"]) or "AI analysis failed or returned empty for Insights."
+
+        # Prepare combined context for the final synthesis step
         trends_context = f"Google Trends Context:\nKeyword: {keyword}\n"
         if interest_df is not None: trends_context += f"- Interest Over Time: Data available.\n"
         else: trends_context += "- Interest Over Time: Data not retrieved or available.\n"
         if related_queries_df is not None:
              related_list = related_queries_df['query'].head().tolist()
-             trends_context += f"- Related Queries Found: {', '.join(related_list)}."
+             trends_context += f"- Related Queries Found: {', '.join(map(str, related_list))}." # Ensure items are strings
         else: trends_context += "- Related Queries: None found or retrieved."
 
+        # Construct the full context for the final synthesis, ensuring prior results are included
         synthesis_input_context = (
             f"{trends_context}\n\n"
             f"Analysis based on News Summaries (if available):\n"
             f"News Themes Summary:\n{gemini_results.get('summary', 'N/A')}\n\n"
             f"Sentiment Analysis Result:\n{gemini_results.get('sentiment', 'N/A')}\n\n"
             f"Identified Insights/Opportunities:\n{gemini_results.get('insights', 'N/A')}\n\n"
-            f"Source News Summaries Used:\n---\n{news_context_for_analysis}\n---"
+            # Provide the raw snippets again for potentially better grounding
+            f"Source News Summaries Used (max {num_news}):\n---\n{news_context_for_analysis}\n---"
         )
 
-        gemini_results["research_synthesis"] = analyze_with_gemini(synthesis_input_context, gemini_prompts["research_synthesis"])
+        # Run the final synthesis analysis, even if some prior steps failed (it might still use trends)
+        gemini_results["research_synthesis"] = analyze_with_gemini(synthesis_input_context, gemini_prompts["research_synthesis"]) or "AI analysis failed or returned empty for Synthesis."
 
+        # Store results in session state
         st.session_state.results_data = {
             "keyword": keyword, "interest_df": interest_df, "related_queries_df": related_queries_df,
             "news_articles": news_articles, "gemini_results": gemini_results
@@ -354,6 +419,7 @@ if search_button and keyword:
 
 
 # --- Display Results ---
+# Check session state for results before displaying
 if st.session_state.results_data:
     results = st.session_state.results_data
     keyword = results["keyword"]
@@ -368,16 +434,24 @@ if st.session_state.results_data:
     with col1:
         st.markdown("**Interest Over Time (Last 3 Months)**")
         if interest_df is not None and not interest_df.empty and keyword in interest_df.columns:
-            interest_df['date'] = pd.to_datetime(interest_df['date'])
-            fig = px.line(interest_df, x='date', y=keyword, title=f'Interest in "{keyword}"')
-            fig.update_layout(xaxis_title="Date", yaxis_title="Relative Interest Index")
-            st.plotly_chart(fig, use_container_width=True)
-        elif 'last_error' not in st.session_state or st.session_state.last_error != '429':
-             st.info(f"Could not retrieve or display Google Trends interest graph for '{keyword}'.")
+            try:
+                interest_df['date'] = pd.to_datetime(interest_df['date'])
+                fig = px.line(interest_df, x='date', y=keyword, title=f'Interest in "{keyword}"')
+                fig.update_layout(xaxis_title="Date", yaxis_title="Relative Interest Index")
+                st.plotly_chart(fig, use_container_width=True)
+            except Exception as plot_err:
+                st.warning(f"Could not plot Google Trends graph: {plot_err}")
+        # Display message only if data is truly None AND not due to rate limit error
+        elif interest_df is None and st.session_state.last_error != '429':
+             st.info(f"Could not retrieve Google Trends interest data for '{keyword}'.")
     with col2:
         st.markdown("**Related Queries (Last 1 Month)**")
         if related_queries_df is not None and not related_queries_df.empty:
-            st.dataframe(related_queries_df[['query', 'value']], use_container_width=True, hide_index=True)
+            # Add try-except for safety, although less likely to fail here
+            try:
+                st.dataframe(related_queries_df[['query', 'value']], use_container_width=True, hide_index=True)
+            except Exception as df_err:
+                st.warning(f"Could not display related queries: {df_err}")
         else:
             st.info("No related queries found or retrieved.")
 
@@ -394,24 +468,25 @@ if st.session_state.results_data:
                 st.markdown(f"<small>Published: {article.get('published', 'N/A')}</small>", unsafe_allow_html=True)
                 col_exp, col_link = st.columns([4,1])
                 with col_exp:
-                     # *** FIXED BLOCK ***
-                     # Get the raw summary, could be string, None, or other type
-                     raw_summary = article.get('summary')
-                     # Ensure summary_text is a string, using default if raw_summary is None
-                     summary_text = str(raw_summary) if raw_summary is not None else "No summary available."
+                    # *** USING THE CORRECTED BLOCK ***
+                    raw_summary = article.get('summary')
+                    if isinstance(raw_summary, str):
+                        # Basic HTML cleaning only if it's a string
+                        cleaned_summary = raw_summary.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '&nbsp;', ' ')
+                    else:
+                        cleaned_summary = "No summary available." # Default if not string
 
-                     # Now apply replacements safely to the guaranteed string
-                     # Basic HTML tag removal
-                     cleaned_summary = summary_text.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '&nbsp;', ' ')
-
-                     with st.expander("Read Summary"):
-                          st.markdown(f"_{cleaned_summary}_", unsafe_allow_html=True)
-                     # *** END OF FIXED BLOCK ***
+                    with st.expander("Read Summary"):
+                        st.markdown(f"_{cleaned_summary}_", unsafe_allow_html=True)
+                    # *** END OF CORRECTED BLOCK ***
                 with col_link:
-                     st.link_button("Read Full Article ↗️", article.get('link', '#'), type="secondary", help="Opens the original article in a new tab")
+                     link_url = article.get('link', '#')
+                     st.link_button("Read Full Article ↗️", link_url, type="secondary", help="Opens the original article in a new tab")
                 st.markdown('<hr style="margin-top:0.5rem; margin-bottom:0.5rem;">', unsafe_allow_html=True)
         else:
-            st.info(f"No news articles found for '{keyword}' to display.")
+            # Display message if search was attempted but no articles found
+            if search_button: # Check if button was pressed for this run
+                st.info(f"No news articles found for '{keyword}' via Google News RSS (India).")
 
     with tab_analysis:
         st.markdown("**Sentiment Analysis (Based on News Summaries):**")
@@ -420,38 +495,46 @@ if st.session_state.results_data:
         st.markdown(gemini_results.get("summary", "_Analysis skipped or failed._"))
         st.markdown("**Key Insights & Opportunities (Derived from News/Trends):**")
         st.markdown(gemini_results.get("insights", "_Analysis skipped or failed._"))
-        st.caption("Note: Insights analysis attempts to link findings to specific news items or trends as requested.")
+        st.caption("Note: Analysis attempts to link findings to specific news items or trends as requested.")
 
     st.markdown("---")
     st.subheader(" H1: Research Synthesis Report (AI Generated)")
     st.markdown(gemini_results.get("research_synthesis", "_Could not generate synthesis report._"))
-    st.caption("Note: Synthesis analysis attempts to ground findings in the provided news/trends data and cite specifics as requested.")
+    st.caption("Note: Synthesis attempts to ground findings in the provided news/trends data and cite specifics as requested.")
 
 
     # --- Download Button ---
     st.markdown("---")
     st.subheader("⬇️ Download Full Report")
-    try:
-        pdf_data = generate_pdf_report(
-            keyword, interest_df, related_queries_df, news_articles, gemini_results
-        )
-        safe_keyword = "".join(c if c.isalnum() else "_" for c in keyword)
-        report_filename = f"Trend_Research_Report_{safe_keyword}.pdf"
-        st.download_button(
-            label="Download Report as PDF",
-            data=pdf_data,
-            file_name=report_filename,
-            mime="application/pdf",
-        )
-    except Exception as pdf_error:
-         st.error(f"Could not generate PDF report: {pdf_error}")
-         st.warning("Ensure 'fpdf2' is installed and fonts (like DejaVu) are accessible.")
+    # Add check if there are results to download before showing button
+    if gemini_results or news_articles or interest_df is not None or related_queries_df is not None:
+        try:
+            pdf_data = generate_pdf_report(
+                keyword, interest_df, related_queries_df, news_articles, gemini_results
+            )
+            safe_keyword = "".join(c if c.isalnum() else "_" for c in keyword)
+            report_filename = f"Trend_Research_Report_{safe_keyword}.pdf"
+            st.download_button(
+                label="Download Report as PDF",
+                data=pdf_data,
+                file_name=report_filename,
+                mime="application/pdf",
+                key="pdf_download_button" # Added key
+            )
+        except Exception as pdf_error:
+             st.error(f"Could not generate PDF report: {pdf_error}")
+             st.warning("Ensure 'fpdf2' is installed and fonts (like DejaVu) are accessible.")
+    else:
+         st.info("No data available to generate a PDF report.")
 
 
+# --- Handle cases where search button wasn't pressed or keyword is empty ---
 elif search_button and not keyword:
     st.warning("Please enter a keyword to research.")
+
+# --- Display persistent error message if rate limit was hit last time ---
 elif 'last_error' in st.session_state and st.session_state.last_error == '429':
-     st.error("🚦 Google Trends Rate Limit Hit (Error 429). Please wait several hours before trying again.")
+     st.error("🚦 Google Trends Rate Limit Hit previously. Please wait several hours before trying again.")
 
 # Footer
 st.markdown("---")
