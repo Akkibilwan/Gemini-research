@@ -39,7 +39,7 @@ for path in potential_paths:
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel('gemini-1.5-flash') # Using 1.5 Flash
+    gemini_model = genai.GenerativeModel('gemini-1.5-flash')
 except KeyError:
     st.error("🚨 Gemini API Key not found! Add it to `.streamlit/secrets.toml`.")
     st.stop()
@@ -55,8 +55,6 @@ pytrends = TrendReq(hl='en-IN', tz=-330) # India settings
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_google_trends(keyword):
     # --- Keep the FULL get_google_trends function ---
-    # --- from the previous responses here.        ---
-    # --- Includes the 429 error handling.         ---
     """Fetches Google Trends data: interest over time and related queries."""
     if not keyword:
         return None, None
@@ -67,15 +65,14 @@ def get_google_trends(keyword):
 
         # Check if the keyword column exists and the DataFrame is not empty
         if interest_over_time_df.empty or keyword not in interest_over_time_df.columns:
-             # st.info(f"No Google Trends interest data found for '{keyword}' in the last 3 months.") # Moved info message to main display logic
-             interest_over_time_df = None # Explicitly set to None
+             interest_over_time_df = None
         elif keyword in interest_over_time_df.columns:
             interest_over_time_df = interest_over_time_df.reset_index()
 
-        # Build payload for related queries (use shorter timeframe)
-        pytrends.build_payload([keyword], cat=0, timeframe='today 1-m', geo='', gprop='') # Last 1 month
+        # Build payload for related queries
+        pytrends.build_payload([keyword], cat=0, timeframe='today 1-m', geo='', gprop='')
         related_queries_dict = pytrends.related_queries()
-        related_queries_df = None # Initialize as None
+        related_queries_df = None
 
         if keyword in related_queries_dict:
             top_queries = related_queries_dict[keyword].get('top')
@@ -94,7 +91,7 @@ def get_google_trends(keyword):
         if '429' in str(e):
             st.error("🚦 Google Trends Rate Limit Hit (Error 429).")
             st.warning("Too many requests sent to Google Trends. Please WAIT several hours before trying again. Using cache if available.")
-            st.session_state.last_error = '429' # Track the error
+            st.session_state.last_error = '429'
         else:
             st.error(f"An error occurred fetching Google Trends data: {e}")
             st.session_state.last_error = str(e)
@@ -102,13 +99,13 @@ def get_google_trends(keyword):
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def get_news_articles(keyword, num_articles=DEFAULT_NUM_ARTICLES):
-    # --- Keep the get_news_articles function from the previous response ---
+    # --- Keep the get_news_articles function ---
     """Fetches news articles related to the keyword using Google News RSS (India)."""
     if not keyword:
         return []
     try:
         query = keyword.replace(' ', '+')
-        news_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en" # India-specific
+        news_url = f"https://news.google.com/rss/search?q={query}&hl=en-IN&gl=IN&ceid=IN:en"
         feed = feedparser.parse(news_url)
         articles = []
         for entry in feed.entries[:num_articles]:
@@ -116,7 +113,7 @@ def get_news_articles(keyword, num_articles=DEFAULT_NUM_ARTICLES):
                 "title": entry.title,
                 "link": entry.link,
                 "published": entry.get("published", "N/A"),
-                "summary": entry.get("summary", "N/A") # Often HTML, needs care
+                "summary": entry.get("summary", "N/A") # Value might be None or non-string
             })
         return articles
     except Exception as e:
@@ -125,28 +122,22 @@ def get_news_articles(keyword, num_articles=DEFAULT_NUM_ARTICLES):
 
 @st.cache_data(ttl=CACHE_TTL_SECONDS)
 def analyze_with_gemini(text_to_analyze, prompt_instruction):
-    # --- Keep the analyze_with_gemini function from the previous response ---
+    # --- Keep the analyze_with_gemini function ---
     """Uses Gemini API for analysis."""
     if not text_to_analyze or not GEMINI_API_KEY:
         return None
     try:
         full_prompt = f"{prompt_instruction}\n\nInput Text/Context:\n---\n{text_to_analyze}\n---"
-        # Consider adjusting generation config for more controlled output if needed
-        # generation_config = genai.types.GenerationConfig(temperature=0.7) # Example
-        response = gemini_model.generate_content(
-            full_prompt,
-            # generation_config=generation_config
-            )
+        response = gemini_model.generate_content(full_prompt)
 
         if response.parts:
-             # Basic cleaning, remove markdown backticks often added by models
              text_response = response.text.replace('```markdown', '').replace('```', '').strip()
              return text_response
         elif response.prompt_feedback.block_reason:
              st.warning(f"Gemini content blocked. Reason: {response.prompt_feedback.block_reason}")
              return f"Content blocked by safety filter ({response.prompt_feedback.block_reason})."
         else:
-             return "Gemini returned an empty response. The prompt might require adjustment or the input context was insufficient."
+             return "Gemini returned an empty response."
 
     except Exception as e:
         st.error(f"Error calling Gemini API: {e}")
@@ -157,15 +148,14 @@ def analyze_with_gemini(text_to_analyze, prompt_instruction):
 
 
 # --- PDF Generation Function ---
-# --- Keep the PDF class and generate_pdf_report function ---
-# --- from the previous response here.                  ---
 class PDF(FPDF):
+    # --- Keep the PDF class definition ---
     def header(self):
         if FONT_PATH:
              self.add_font('DejaVu', '', FONT_PATH, uni=True)
              self.set_font('DejaVu', '', 12)
         else:
-             self.set_font('Arial', 'B', 12) # Fallback
+             self.set_font('Arial', 'B', 12)
         self.cell(0, 10, 'Trend Hunter - Research Report', 0, 1, 'C')
         self.ln(5)
 
@@ -186,24 +176,17 @@ class PDF(FPDF):
         self.ln(4)
 
     def chapter_body(self, body):
-        if not body:
-             body = "N/A"
-        if FONT_PATH:
-            self.set_font('DejaVu', '', 10)
-        else:
-             self.set_font('Arial', '', 10)
-        try:
-             safe_body = body.encode('latin-1', 'replace').decode('latin-1')
-        except Exception:
-             safe_body = str(body)
+        if not body: body = "N/A"
+        if FONT_PATH: self.set_font('DejaVu', '', 10)
+        else: self.set_font('Arial', '', 10)
+        try: safe_body = body.encode('latin-1', 'replace').decode('latin-1')
+        except Exception: safe_body = str(body)
         self.multi_cell(0, 5, safe_body)
         self.ln()
 
     def add_link(self, text, link):
-        if FONT_PATH:
-             self.set_font('DejaVu', '', 10)
-        else:
-             self.set_font('Arial', '', 10)
+        if FONT_PATH: self.set_font('DejaVu', '', 10)
+        else: self.set_font('Arial', '', 10)
         self.set_text_color(0, 0, 255)
         safe_text = str(text) if text else "Link"
         self.cell(0, 5, safe_text, 0, 1, link=link)
@@ -212,6 +195,7 @@ class PDF(FPDF):
 
 
 def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles, gemini_results):
+    # --- Keep the generate_pdf_report function ---
     pdf = PDF()
     pdf.add_page()
     pdf.chapter_title(f"Research Report for: \"{keyword}\"")
@@ -267,6 +251,7 @@ def generate_pdf_report(keyword, interest_df, related_queries_df, news_articles,
     pdf_buffer.seek(0)
     return pdf_buffer.getvalue()
 
+
 # --- Streamlit App Layout ---
 
 st.title("📈 Trend Hunter: Research Assistant")
@@ -306,89 +291,71 @@ if search_button and keyword:
 
         # 3. Prepare text for Gemini
         news_context_for_analysis = "No relevant news articles found recently for detailed analysis."
-        news_snippets = [] # Store snippets for context
+        news_snippets = []
         if news_articles:
             st.info(f"📰 Found {len(news_articles)} news articles. Preparing context for AI analysis...")
             news_context_list = []
             for i, article in enumerate(news_articles):
-                 # Clean up summary - often contains HTML, try basic removal
-                 summary = article.get('summary', 'No summary available.')
-                 # Basic HTML tag removal - replace with more robust method if needed
-                 summary = summary.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '').replace('&nbsp;', ' ')
-                 snippet = f"Article {i+1} (Title: {article.get('title', 'N/A')} | Published: {article.get('published', 'N/A')}):\nSummary: {summary}\nLink: {article.get('link', '#')}\n"
+                 raw_summary = article.get('summary') # Get raw summary
+                 summary_text = str(raw_summary) if raw_summary is not None else "No summary available." # Ensure string
+                 # Basic HTML tag removal
+                 cleaned_summary = summary_text.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '&nbsp;', ' ')
+                 snippet = f"Article {i+1} (Title: {article.get('title', 'N/A')} | Published: {article.get('published', 'N/A')}):\nSummary: {cleaned_summary}\nLink: {article.get('link', '#')}\n"
                  news_context_list.append(snippet)
-                 news_snippets.append(snippet) # Keep snippets separate for final prompt if needed
+                 news_snippets.append(snippet)
 
-            news_context_for_analysis = "\n---\n".join(news_context_list) # Join with separator
+            news_context_for_analysis = "\n---\n".join(news_context_list)
         else:
              st.warning("📰 No news articles found. AI analysis will be based on trends data only (if available).")
 
-
-        # 4. Gemini Analysis (***REVISED PROMPTS***)
+        # 4. Gemini Analysis (Revised Prompts)
         gemini_prompts = {
              "summary": f"You are a factual research assistant. Based *strictly* on the provided news article summaries about '{keyword}', summarize the key factual themes, topics, events, and mentioned entities. Avoid interpretation or adding external information. Focus on accurately reflecting the content of the provided summaries.",
-
              "sentiment": f"You are an objective sentiment analyst reviewing news about '{keyword}'. Analyze the overall sentiment (Positive, Negative, Neutral) expressed *only within the provided news summaries*. State the dominant sentiment and **justify your conclusion by quoting one or two specific phrases or sentences from the provided text** that strongly support this sentiment rating.",
-
              "insights": f"You are a strategic analyst researching '{keyword}'. Based *only* on the provided news summaries and trends context, identify 3-5 specific insights or potential opportunities/challenges. **For each insight, explicitly mention which news summary (e.g., 'Article 3 summary mentions...') or trend observation it stems from.** Frame these as concise, evidence-based bullet points.",
-
              "research_synthesis": f"You are a research analyst synthesizing information about '{keyword}'. Based *strictly and solely* on the provided context below (which includes a Google Trends summary, news article summaries, sentiment analysis, and extracted insights), generate a concise research report section. **Crucially, ground your synthesis in the provided text:** explicitly reference specific news points (e.g., 'As mentioned in Article 2 summary...', 'The trend data suggests X, aligning with the news about Y...'), sentiment findings, or insights when discussing each point. Use direct (but short) quotes from the provided news text *where appropriate* to support your analysis.\n\nStructure the report like this:\n1.  **Overall Summary:** Briefly combine the key news themes and the identified sentiment, referencing specific news points.\n2.  **Trend Connection:** Discuss how the Google Trends data (interest, related queries) relates to or contrasts with the topics found in the news summaries. Cite specific examples.\n3.  **Opportunities & Challenges:** Synthesize the key opportunities and potential challenges identified in the 'insights' section, clearly linking them back to specific news summaries or trend data.\n4.  **Concluding Outlook:** Provide a brief concluding thought based *only* on the synthesized information, reiterating the main evidence."
-         }
+        }
 
         gemini_results = {}
         analysis_skipped_message = "Analysis skipped as no news articles were found."
 
-        # Run analysis based on news context *only if* news was found
         if news_articles:
             gemini_results["summary"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["summary"])
             gemini_results["sentiment"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["sentiment"])
-            gemini_results["insights"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["insights"]) # Insights now also depend on news
+            gemini_results["insights"] = analyze_with_gemini(news_context_for_analysis, gemini_prompts["insights"])
         else:
             gemini_results["summary"] = analysis_skipped_message
             gemini_results["sentiment"] = analysis_skipped_message
             gemini_results["insights"] = analysis_skipped_message
 
-        # Prepare combined context for the final synthesis
         trends_context = f"Google Trends Context:\nKeyword: {keyword}\n"
-        if interest_df is not None:
-             trends_context += f"- Interest Over Time: Data available (details in graph/report section).\n"
-        else:
-             trends_context += "- Interest Over Time: Data not retrieved or available.\n"
+        if interest_df is not None: trends_context += f"- Interest Over Time: Data available.\n"
+        else: trends_context += "- Interest Over Time: Data not retrieved or available.\n"
         if related_queries_df is not None:
              related_list = related_queries_df['query'].head().tolist()
-             trends_context += f"- Related Queries Found: {', '.join(related_list)} (and potentially more)."
-        else:
-             trends_context += "- Related Queries: None found or retrieved."
+             trends_context += f"- Related Queries Found: {', '.join(related_list)}."
+        else: trends_context += "- Related Queries: None found or retrieved."
 
-        # Combine all available context for synthesis
         synthesis_input_context = (
             f"{trends_context}\n\n"
             f"Analysis based on News Summaries (if available):\n"
             f"News Themes Summary:\n{gemini_results.get('summary', 'N/A')}\n\n"
             f"Sentiment Analysis Result:\n{gemini_results.get('sentiment', 'N/A')}\n\n"
             f"Identified Insights/Opportunities:\n{gemini_results.get('insights', 'N/A')}\n\n"
-            # Provide the raw snippets again for grounding the synthesis
             f"Source News Summaries Used:\n---\n{news_context_for_analysis}\n---"
         )
 
-        # Run the final synthesis analysis
         gemini_results["research_synthesis"] = analyze_with_gemini(synthesis_input_context, gemini_prompts["research_synthesis"])
 
-        # Store results
         st.session_state.results_data = {
-            "keyword": keyword,
-            "interest_df": interest_df,
-            "related_queries_df": related_queries_df,
-            "news_articles": news_articles, # Store original articles for display/PDF links
-            "gemini_results": gemini_results
+            "keyword": keyword, "interest_df": interest_df, "related_queries_df": related_queries_df,
+            "news_articles": news_articles, "gemini_results": gemini_results
         }
 
 
 # --- Display Results ---
 if st.session_state.results_data:
     results = st.session_state.results_data
-    # --- Keep the Display logic sections mostly the same ---
-    # --- It will now display the output from the revised prompts ---
     keyword = results["keyword"]
     interest_df = results["interest_df"]
     related_queries_df = results["related_queries_df"]
@@ -427,14 +394,22 @@ if st.session_state.results_data:
                 st.markdown(f"<small>Published: {article.get('published', 'N/A')}</small>", unsafe_allow_html=True)
                 col_exp, col_link = st.columns([4,1])
                 with col_exp:
-                     # Clean summary for display (basic HTML removal)
-                     summary_text = article.get('summary', 'No summary available.')
-                     summary_text = summary_text.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '&nbsp;', ' ')
+                     # *** FIXED BLOCK ***
+                     # Get the raw summary, could be string, None, or other type
+                     raw_summary = article.get('summary')
+                     # Ensure summary_text is a string, using default if raw_summary is None
+                     summary_text = str(raw_summary) if raw_summary is not None else "No summary available."
+
+                     # Now apply replacements safely to the guaranteed string
+                     # Basic HTML tag removal
+                     cleaned_summary = summary_text.replace('<p>', '').replace('</p>', '').replace('<b>', '').replace('</b>', '&nbsp;', ' ')
+
                      with st.expander("Read Summary"):
-                          st.markdown(f"_{summary_text}_", unsafe_allow_html=True) # Allow basic markdown in summary
+                          st.markdown(f"_{cleaned_summary}_", unsafe_allow_html=True)
+                     # *** END OF FIXED BLOCK ***
                 with col_link:
                      st.link_button("Read Full Article ↗️", article.get('link', '#'), type="secondary", help="Opens the original article in a new tab")
-                st.markdown('<hr style="margin-top:0.5rem; margin-bottom:0.5rem;">', unsafe_allow_html=True) # Thinner separator
+                st.markdown('<hr style="margin-top:0.5rem; margin-bottom:0.5rem;">', unsafe_allow_html=True)
         else:
             st.info(f"No news articles found for '{keyword}' to display.")
 
@@ -475,7 +450,7 @@ if st.session_state.results_data:
 
 elif search_button and not keyword:
     st.warning("Please enter a keyword to research.")
-elif st.session_state.last_error == '429':
+elif 'last_error' in st.session_state and st.session_state.last_error == '429':
      st.error("🚦 Google Trends Rate Limit Hit (Error 429). Please wait several hours before trying again.")
 
 # Footer
