@@ -1,0 +1,7 @@
+streamlit
+pandas
+pytrends
+feedparser  # For parsing RSS feeds (e.g., Google News)
+google-generativeai # For Gemini API
+plotly # For interactive charts
+requests # Generally useful for APIs
